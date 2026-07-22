@@ -76,6 +76,15 @@ class AppConfig:
         self.SECRET_KEY = _secret_key
         self.OIDC_CLIENT_SECRET = config_manager.get("OIDC_CLIENT_SECRET")
 
+        # PKCE configuration for public OIDC clients.
+        # When set to "S256", the authorization code flow uses PKCE and
+        # OIDC_CLIENT_SECRET can be omitted. Any non-empty value other than
+        # "S256" is rejected because plain PKCE provides no security benefit.
+        _oidc_code_challenge = config_manager.get("OIDC_CODE_CHALLENGE")
+        if _oidc_code_challenge and _oidc_code_challenge != "S256":
+            raise ValueError(f"Invalid OIDC_CODE_CHALLENGE value: '{_oidc_code_challenge}'. " "Only 'S256' is supported; leave unset to disable PKCE.")
+        self.OIDC_CODE_CHALLENGE = _oidc_code_challenge
+
         # Session cookie settings
         self.SESSION_COOKIE_NAME = config_manager.get("SESSION_COOKIE_NAME", "session")
         self.SESSION_COOKIE_MAX_AGE_SECONDS = config_manager.get_int("SESSION_COOKIE_MAX_AGE_SECONDS", default=14 * 24 * 60 * 60) or None

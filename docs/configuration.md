@@ -10,7 +10,8 @@ The application is configured through environment variables, `.env` files, or pl
 |----------|------|---------|-------------|
 | `OIDC_DISCOVERY_URL` | String | *Required* | OIDC discovery endpoint URL (e.g., `https://idp.example.com/.well-known/openid-configuration`) |
 | `OIDC_CLIENT_ID` | String | *Required* | Client ID registered with your OIDC provider |
-| `OIDC_CLIENT_SECRET` | String | *Required* | Client secret for your OIDC application |
+| `OIDC_CLIENT_SECRET` | String | *Required unless PKCE* | Client secret for your OIDC application. Can be omitted when `OIDC_CODE_CHALLENGE=S256` |
+| `OIDC_CODE_CHALLENGE` | String | None | PKCE code challenge method. Set to `S256` to enable PKCE for public clients. Omit (or leave empty) to use a confidential client with `OIDC_CLIENT_SECRET` |
 | `OIDC_REDIRECT_URI` | String | Auto-detected | Redirect URI for the OIDC callback (`/callback`). If not set, calculated dynamically from proxy headers, which works correctly behind reverse proxies |
 | `OIDC_SCOPE` | String | `openid,email,profile` | Comma-separated list of OIDC scopes to request |
 | `OIDC_AUDIENCE` | String | None | Expected JWT `aud` claim value (e.g., your client ID or API identifier). When set, bearer tokens are rejected if the `aud` claim doesn't match. Recommended for production to prevent token confusion attacks |
@@ -142,6 +143,16 @@ MLflow natively supports environment variables for server configuration. These a
 OIDC_DISCOVERY_URL=https://your-idp.example.com/.well-known/openid-configuration
 OIDC_CLIENT_ID=mlflow-dev
 OIDC_CLIENT_SECRET=dev-secret
+SECRET_KEY=dev-not-for-production
+```
+
+or for public client (no client secret) where PKCE is required
+
+```bash
+# .env file
+OIDC_DISCOVERY_URL=https://your-idp.example.com/.well-known/openid-configuration
+OIDC_CLIENT_ID=mlflow-dev-public
+OIDC_CODE_CHALLENGE=S256
 SECRET_KEY=dev-not-for-production
 ```
 
