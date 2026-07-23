@@ -6,6 +6,7 @@ This router handles OIDC authentication flows including login, logout, and callb
 
 import secrets
 import time
+import traceback
 from collections.abc import Awaitable
 from typing import Any, Optional
 from urllib.parse import urlencode
@@ -303,6 +304,7 @@ async def login(request: Request):
             raise
         except Exception as e:
             logger.error(f"Failed to initiate OAuth redirect: {e}")
+            logger.debug("OIDC redirect failure traceback: %s", traceback.format_exc())
             raise HTTPException(status_code=500, detail="Failed to initiate OIDC login")
 
     except HTTPException:
@@ -310,6 +312,7 @@ async def login(request: Request):
         raise
     except Exception as e:
         logger.error(f"Error initiating OIDC login: {e}")
+        logger.debug("OIDC login failure traceback: %s", traceback.format_exc())
         raise HTTPException(status_code=500, detail="Failed to initiate OIDC login")
 
 
