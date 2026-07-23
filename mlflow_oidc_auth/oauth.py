@@ -80,6 +80,14 @@ def ensure_oidc_client_registered() -> bool:
     if config.OIDC_CODE_CHALLENGE:
         client_kwargs["code_challenge_method"] = config.OIDC_CODE_CHALLENGE
 
+    if not config.OIDC_SSL_VERIFY:
+        logger.warning(
+            "OIDC_SSL_VERIFY is disabled: TLS certificate verification for the OIDC "
+            "provider is turned off. This is insecure and should only be used in "
+            "test environments with self-signed certificates."
+        )
+        client_kwargs["verify"] = False
+
     registration_kwargs = {
         "name": "oidc",
         "client_id": config.OIDC_CLIENT_ID,

@@ -523,6 +523,7 @@ class TestPKCEAndOptionalClientSecret(unittest.TestCase):
             mock_register.assert_called_once()
             kwargs = mock_register.call_args.kwargs
             self.assertNotIn("code_challenge_method", kwargs["client_kwargs"])
+            self.assertNotIn("verify", kwargs["client_kwargs"])
             self.assertEqual(kwargs["client_secret"], "test-client-secret")
 
     def test_client_secret_passed_when_present(self):
@@ -538,6 +539,19 @@ class TestPKCEAndOptionalClientSecret(unittest.TestCase):
             kwargs = mock_register.call_args.kwargs
             self.assertEqual(kwargs["client_secret"], "test-secret")
             self.assertEqual(kwargs["client_kwargs"]["code_challenge_method"], "S256")
+
+    def test_client_kwargs_disable_verify_when_ssl_verify_false(self):
+        from mlflow_oidc_auth import oauth as oauth_mod
+
+        oauth_mod.reset_oauth()
+        mock_register = MagicMock()
+        with (
+            self._patch_config(oauth_mod, OIDC_SSL_VERIFY=False),
+            patch.object(oauth_mod.oauth, "register", mock_register),
+        ):
+            oauth_mod.ensure_oidc_client_registered()
+            kwargs = mock_register.call_args.kwargs
+            self.assertEqual(kwargs["client_kwargs"]["verify"], False)
 
     def test_has_required_config_allows_pkce_without_secret(self):
         from mlflow_oidc_auth import oauth as oauth_mod

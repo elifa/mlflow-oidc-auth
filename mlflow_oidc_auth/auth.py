@@ -9,6 +9,11 @@ from mlflow_oidc_auth.config import config
 from mlflow_oidc_auth.logger import get_logger
 from mlflow_oidc_auth.user import create_user, populate_groups, update_user
 
+
+def _get_requests_verify() -> bool:
+    """Return the TLS verification setting for requests calls to the IdP."""
+    return config.OIDC_SSL_VERIFY
+
 logger = get_logger()
 
 # JWKS cache: single-entry TTL cache shared across all token validations.
@@ -46,15 +51,16 @@ def _get_oidc_jwks(force_refresh: bool = False) -> dict:
             return cached
 
     # Fetch outside the lock to avoid blocking other threads during HTTP I/O
+    verify = _get_requests_verify()
     try:
         logger.debug("Fetching OIDC discovery metadata")
-        metadata = requests.get(config.OIDC_DISCOVERY_URL).json()
+        metadata = requests.get(config.OIDC_DISCOVERY_URL, verify=verify).json()
         jwks_uri = metadata.get("jwks_uri")
         if not jwks_uri:
             raise ValueError("No jwks_uri found in OIDC discovery metadata")
 
         logger.debug("Fetching JWKS from %s", jwks_uri)
-        jwks = requests.get(jwks_uri).json()
+        jwks = requests.get(jwks_uri, verify=verify).json()
     except requests.exceptions.RequestException as e:
         logger.error("Failed to fetch OIDC JWKS: %s", e)
         raise

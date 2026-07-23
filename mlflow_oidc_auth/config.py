@@ -120,6 +120,12 @@ class AppConfig:
         # JWKS caching settings
         self.OIDC_JWKS_CACHE_TTL_SECONDS = config_manager.get_int("OIDC_JWKS_CACHE_TTL_SECONDS", default=300)
 
+        # TLS verification for the OIDC provider. Set to "false" to disable
+        # certificate verification when the IdP uses a self-signed certificate
+        # (e.g. in test environments). This is intentionally opt-in and logged
+        # loudly because disabling verification is insecure for production.
+        self.OIDC_SSL_VERIFY = config_manager.get_bool("OIDC_SSL_VERIFY", default=True)
+
         # Permission cache settings
         self.PERMISSION_CACHE_TTL_SECONDS = config_manager.get_int("PERMISSION_CACHE_TTL_SECONDS", default=30)
 
