@@ -15,6 +15,7 @@ from cachetools import TTLCache
 from fastapi import Request, Response
 from fastapi.responses import RedirectResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.routing import get_route_path
 from starlette.types import ASGIApp
 
 from mlflow_oidc_auth.config import config
@@ -28,6 +29,7 @@ from mlflow_oidc_auth.audit import emit_audit_event
 from mlflow_oidc_auth.auth import validate_token
 from mlflow_oidc_auth.store import store
 from mlflow_oidc_auth.utils.oidc_field_extraction import extract_username, extract_display_name, BEARER_TOKEN_SOURCE
+from mlflow_oidc_auth.utils.gateway_passthrough import GATEWAY_PASSTHROUGH_SCOPE_KEY, allow_unauthenticated_gateway_call
 
 logger = get_logger()
 
@@ -606,7 +608,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         Returns:
             Response from the application or an authentication redirect
         """
-        path = request.url.path
+        # Authorize on the path Starlette actually routes on, not the external path.
+        path = get_route_path(request.scope)
 
         # Skip authentication for unprotected routes
         if self._is_unprotected_route(path):
@@ -662,6 +665,16 @@ class AuthMiddleware(BaseHTTPMiddleware):
             # Proceed to the next middleware/handler
             return await call_next(request)
         else:
+            if allow_unauthenticated_gateway_call(path, request.headers):
+                # Recorded so fastapi_permission_middleware can re-check this admission
+                # against the path Starlette finally routes on.
+                request.scope[GATEWAY_PASSTHROUGH_SCOPE_KEY] = True
+                logger.debug(
+                    "Gateway call from a client supplying its own provider credentials; skipping OIDC authentication for %s",
+                    path,
+                )
+                return await call_next(request)
+
             # Authentication failed - for API routes return 401 JSON, else redirect to login
             logger.info(f"Authentication failed for {path}: {error_msg}")
             return await self._deny(request, path)
