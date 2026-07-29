@@ -716,6 +716,59 @@ class TestAuthMiddleware:
             assert request.state.is_admin is False
 
     @pytest.mark.asyncio
+    async def test_dispatch_gateway_passthrough_calls_through(self, auth_middleware, create_mock_request, mock_config):
+        """Gateway callers supplying their own provider credentials skip OIDC auth."""
+        gateway_config = MagicMock()
+        gateway_config.OIDC_GATEWAY_END_USER_AUTH_ENDPOINTS = ["my-ep"]
+        with (
+            patch("mlflow_oidc_auth.middleware.auth_middleware.config", mock_config),
+            patch("mlflow_oidc_auth.utils.gateway_passthrough.config", gateway_config),
+        ):
+            request = create_mock_request(
+                path="/gateway/proxy/my-ep/models",
+                session={},
+                headers={"user-agent": "claude-cli/1.0", "authorization": "token upstream-token"},
+            )
+
+            async def mock_call_next(req):
+                return Response(content="ok", status_code=200)
+
+            response = await auth_middleware.dispatch(request, mock_call_next)
+
+            assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_dispatch_gateway_passthrough_disabled_returns_401(self, auth_middleware, create_mock_request, mock_config):
+        """With an empty allowlist, an unauthenticated gateway call still gets 401."""
+        gateway_config = MagicMock()
+        gateway_config.OIDC_GATEWAY_END_USER_AUTH_ENDPOINTS = []
+        with (
+            patch("mlflow_oidc_auth.middleware.auth_middleware.config", mock_config),
+            patch("mlflow_oidc_auth.utils.gateway_passthrough.config", gateway_config),
+        ):
+            request = create_mock_request(
+                path="/gateway/proxy/my-ep/models",
+                session={},
+                headers={"user-agent": "claude-cli/1.0", "authorization": "token upstream-token"},
+            )
+
+            response = await auth_middleware.dispatch(request, lambda r: pytest.fail("call_next should not be called"))
+
+            assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_dispatch_uses_routed_path_not_external_path(self, auth_middleware, create_mock_request, mock_config):
+        """A client-supplied X-Forwarded-Prefix must not change which path is authorized."""
+        with patch("mlflow_oidc_auth.middleware.auth_middleware.config", mock_config):
+            request = create_mock_request(path="/proxied/api/experiments", session={})
+            request.scope["root_path"] = "/proxied"
+
+            response = await auth_middleware.dispatch(request, lambda r: pytest.fail("call_next should not be called"))
+
+            # /api/... is the routed path, so the API-style 401 wins over a login redirect.
+            assert response.status_code == 401
+
+    @pytest.mark.asyncio
     async def test_dispatch_authentication_failure_logging(self, auth_middleware, create_mock_request, mock_logger):
         """Test that authentication failures are properly logged."""
         with (

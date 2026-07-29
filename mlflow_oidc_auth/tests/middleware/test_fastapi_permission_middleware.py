@@ -39,6 +39,18 @@ class TestExtractGatewayEndpointName:
         """Test invocations pattern with wrong suffix."""
         assert self._extract("/gateway/my-endpoint/mlflow/other") is None
 
+    def test_proxy_route_with_trailing_path(self):
+        """Test /gateway/proxy/{endpoint_name}/{path:path} pattern."""
+        assert self._extract("/gateway/proxy/my-endpoint/models") == "my-endpoint"
+
+    def test_proxy_route_with_multi_segment_path(self):
+        """Test proxy route with a multi-segment trailing path."""
+        assert self._extract("/gateway/proxy/my-endpoint/v1/chat/completions") == "my-endpoint"
+
+    def test_proxy_route_without_trailing_path(self):
+        """Test proxy route with no trailing path."""
+        assert self._extract("/gateway/proxy/my-endpoint") == "my-endpoint"
+
     def test_chat_completions_mlflow(self):
         """Test MLflow chat completions passthrough."""
         result = self._extract("/gateway/mlflow/v1/chat/completions", {"model": "my-model"})
@@ -58,6 +70,11 @@ class TestExtractGatewayEndpointName:
         """Test OpenAI responses passthrough."""
         result = self._extract("/gateway/openai/v1/responses", {"model": "gpt-4o"})
         assert result == "gpt-4o"
+
+    def test_responses_compact_openai(self):
+        """Test OpenAI compact responses passthrough."""
+        result = self._extract("/gateway/openai/v1/responses/compact", {"model": "ep"})
+        assert result == "ep"
 
     def test_anthropic_messages(self):
         """Test Anthropic messages passthrough."""
@@ -200,6 +217,22 @@ class TestGatewayValidator:
 
     @pytest.mark.asyncio
     @patch("mlflow_oidc_auth.middleware.fastapi_permission_middleware.can_use_gateway_endpoint")
+    async def test_proxy_get_does_not_read_body(self, mock_can_use):
+        """Test GET proxy route resolves the endpoint from the URL without reading the body."""
+        mock_can_use.return_value = True
+        validator = self._get_gateway_validator("/gateway/proxy/my-endpoint/models")
+        request = MagicMock(spec=Request)
+        request.method = "GET"
+        request.json = AsyncMock(side_effect=AssertionError("body must not be read for GET"))
+        request.state = MagicMock()
+
+        result = await validator("user@example.com", request)
+        assert result is True
+        mock_can_use.assert_called_once_with("my-endpoint", "user@example.com")
+        request.json.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("mlflow_oidc_auth.middleware.fastapi_permission_middleware.can_use_gateway_endpoint")
     async def test_gemini_route(self, mock_can_use):
         """Test Gemini generateContent route extracts endpoint name."""
         mock_can_use.return_value = True
@@ -293,13 +326,16 @@ class TestRequireAuthenticationValidator:
 # ---------------------------------------------------------------------------
 
 
-def _create_app_with_auth(username=None, is_admin=False):
+def _create_app_with_auth(username=None, is_admin=False, with_proxy_headers=False):
     """Create a test FastAPI app with auth context and permission middleware.
 
     Starlette ``@app.middleware("http")`` uses LIFO ordering: the last middleware
     registered wraps the outermost layer and runs first.  We must register the
     permission middleware FIRST, then the auth-context middleware, so that
     auth context is set before the permission middleware reads it.
+
+    ``with_proxy_headers`` inserts the real ``ProxyHeadersMiddleware`` between the two,
+    reproducing the production order Auth → ProxyHeaders → Permission.
     """
     from mlflow_oidc_auth.middleware.fastapi_permission_middleware import (
         add_fastapi_permission_middleware,
@@ -310,6 +346,21 @@ def _create_app_with_auth(username=None, is_admin=False):
     @app.get("/gateway/{endpoint_name}/mlflow/invocations")
     async def gateway_invocations(endpoint_name: str):
         return {"endpoint": endpoint_name}
+
+    @app.get("/gateway/proxy/{endpoint_name}/user-agent")
+    async def gateway_proxy_user_agent(endpoint_name: str, request: Request):
+        return {
+            "endpoint": endpoint_name,
+            "user_agents": request.headers.getlist("user-agent"),
+        }
+
+    @app.get("/gateway/proxy/{endpoint_name}/{path:path}")
+    async def gateway_proxy(endpoint_name: str, path: str):
+        return {"endpoint": endpoint_name, "path": path}
+
+    @app.post("/gateway/openai/v1/chat/completions")
+    async def gateway_chat_completions(request: Request):
+        return {"cached_body": getattr(request.state, "cached_body", None)}
 
     @app.get("/v1/traces")
     async def otel_traces():
@@ -330,13 +381,36 @@ def _create_app_with_auth(username=None, is_admin=False):
     # Register permission middleware FIRST (will be inner)
     add_fastapi_permission_middleware(app)
 
-    # Register auth context SECOND (will be outer — runs first)
+    if with_proxy_headers:
+        from mlflow_oidc_auth.middleware.proxy_headers_middleware import ProxyHeadersMiddleware
+
+        app.add_middleware(ProxyHeadersMiddleware)
+
+    # Register auth context LAST (will be outer — runs first)
     if username is not None:
 
         @app.middleware("http")
         async def inject_auth_context(request: Request, call_next):
             request.state.username = username
             request.state.is_admin = is_admin
+            return await call_next(request)
+
+    else:
+
+        @app.middleware("http")
+        async def emulate_unauthenticated_auth_middleware(request: Request, call_next):
+            # Mirrors AuthMiddleware: admit credential-carrying gateway callers, recording
+            # the decision so the permission middleware can re-check the routed path.
+            from starlette.routing import get_route_path
+
+            from mlflow_oidc_auth.utils.gateway_passthrough import (
+                GATEWAY_PASSTHROUGH_SCOPE_KEY,
+                allow_unauthenticated_gateway_call,
+            )
+
+            if allow_unauthenticated_gateway_call(get_route_path(request.scope), request.headers):
+                request.scope[GATEWAY_PASSTHROUGH_SCOPE_KEY] = True
+
             return await call_next(request)
 
     return app
@@ -484,3 +558,307 @@ class TestFastapiPermissionMiddlewareIntegration:
         client = TestClient(app)
         response = client.get("/gateway/my-ep/mlflow/invocations")
         assert response.status_code == 403
+
+    @patch("mlflow_oidc_auth.middleware.fastapi_permission_middleware.allow_unauthenticated_gateway_call")
+    def test_unauthenticated_gateway_passthrough_disabled_returns_401(self, mock_allow):
+        """Test that an unauthenticated gateway call is rejected when pass-through is off."""
+        mock_allow.return_value = False
+        app = self._create_app_with_middleware()
+        client = TestClient(app)
+        response = client.get("/gateway/proxy/my-ep/models")
+        assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: unauthenticated end-user-authenticated endpoint allowlist
+# ---------------------------------------------------------------------------
+
+
+def _config(endpoints):
+    """Build a config double exposing only the gateway allowlist."""
+    config_mock = MagicMock()
+    config_mock.OIDC_GATEWAY_END_USER_AUTH_ENDPOINTS = endpoints
+    return config_mock
+
+
+class TestUnauthenticatedGatewayAllowlist:
+    """Test the per-endpoint allowlist for callers with no OIDC identity."""
+
+    _CLI_HEADERS = {"user-agent": "claude-cli/1.0.99 (external, cli)", "Authorization": "Bearer upstream-token"}
+
+    def _client(self):
+        return TestClient(_create_app_with_auth(username=None))
+
+    def test_url_derived_listed_endpoint_passes(self):
+        """Test a listed URL-derived endpoint reaches the handler."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-ep"])):
+            response = self._client().get("/gateway/proxy/my-ep/models", headers=self._CLI_HEADERS)
+
+        assert response.status_code == 200
+        assert response.json() == {"endpoint": "my-ep", "path": "models"}
+
+    def test_url_derived_unlisted_endpoint_returns_401(self):
+        """Test an unlisted URL-derived endpoint is rejected despite credentials."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-ep"])):
+            response = self._client().get("/gateway/proxy/other-ep/models", headers=self._CLI_HEADERS)
+
+        assert response.status_code == 401
+
+    def test_url_derived_listed_endpoint_without_credentials_returns_401(self):
+        """Test a listed endpoint still needs the caller's own credential header."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-ep"])):
+            response = self._client().get("/gateway/proxy/my-ep/models")
+
+        assert response.status_code == 401
+
+    def test_url_derived_empty_allowlist_returns_401(self):
+        """Test an empty allowlist rejects even a would-be listed endpoint."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config([])):
+            response = self._client().get("/gateway/proxy/my-ep/models", headers=self._CLI_HEADERS)
+
+        assert response.status_code == 401
+
+    def test_body_derived_listed_endpoint_passes_and_caches_body(self):
+        """Test a listed body-derived endpoint passes and leaves the body readable."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-model"])):
+            response = self._client().post(
+                "/gateway/openai/v1/chat/completions",
+                json={"model": "my-model"},
+                headers=self._CLI_HEADERS,
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"cached_body": {"model": "my-model"}}
+
+    def test_body_derived_unlisted_endpoint_returns_401(self):
+        """Test an unlisted body-derived endpoint is rejected despite credentials."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-model"])):
+            response = self._client().post(
+                "/gateway/openai/v1/chat/completions",
+                json={"model": "other-model"},
+                headers=self._CLI_HEADERS,
+            )
+
+        assert response.status_code == 401
+
+    def test_body_derived_listed_endpoint_without_credentials_returns_401(self):
+        """Test a listed body-derived endpoint still needs a credential header."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-model"])):
+            response = self._client().post("/gateway/openai/v1/chat/completions", json={"model": "my-model"})
+
+        assert response.status_code == 401
+
+    def test_body_derived_empty_allowlist_returns_401(self):
+        """Test an empty allowlist rejects a body-derived endpoint too."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config([])):
+            response = self._client().post(
+                "/gateway/openai/v1/chat/completions",
+                json={"model": "my-model"},
+                headers=self._CLI_HEADERS,
+            )
+
+        assert response.status_code == 401
+
+    @patch("mlflow_oidc_auth.middleware.fastapi_permission_middleware.can_use_gateway_endpoint")
+    def test_authenticated_user_still_needs_use_permission_on_listed_endpoint(self, mock_can_use):
+        """Test designation does not disable authorization for callers with an identity."""
+        mock_can_use.return_value = False
+        app = _create_app_with_auth(username="user@example.com", is_admin=False)
+        client = TestClient(app)
+
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-ep"])):
+            response = client.get("/gateway/proxy/my-ep/models", headers=self._CLI_HEADERS)
+
+        assert response.status_code == 403
+        mock_can_use.assert_called_once_with("my-ep", "user@example.com")
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: the caller's User-Agent must reach MLflow unmodified
+# ---------------------------------------------------------------------------
+
+
+class TestClientUserAgentIsForwardedUnmodified:
+    """Test that admitted callers reach MLflow with their request unmodified."""
+
+    _CLI_HEADERS = {"user-agent": "claude-cli/1.0.99 (external, cli)", "Authorization": "Bearer upstream-token"}
+    _ODD_UA_HEADERS = {"user-agent": "weird-agent/9", "Authorization": "Bearer upstream-token"}
+
+    def _client(self, username=None, is_admin=False):
+        return TestClient(_create_app_with_auth(username=username, is_admin=is_admin))
+
+    def test_listed_endpoint_reaches_handler_with_user_agent_unmodified(self):
+        """Test an allowed unauthenticated call arrives upstream exactly as sent."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-ep"])):
+            response = self._client().get("/gateway/proxy/my-ep/user-agent", headers=self._CLI_HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["user_agents"] == [self._CLI_HEADERS["user-agent"]]
+
+    def test_unlisted_endpoint_returns_401_and_never_reaches_handler(self):
+        """Test an unlisted endpoint is rejected before the handler runs."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-ep"])):
+            response = self._client().get("/gateway/proxy/other-ep/user-agent", headers=self._CLI_HEADERS)
+
+        assert response.status_code == 401
+        assert "user_agents" not in response.json()
+
+    def test_unrecognised_user_agent_returns_401(self):
+        """Test a caller MLflow would serve the server key to is rejected outright."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-ep"])):
+            response = self._client().get("/gateway/proxy/my-ep/user-agent", headers=self._ODD_UA_HEADERS)
+
+        assert response.status_code == 401
+        assert "user_agents" not in response.json()
+
+    def test_missing_user_agent_returns_401(self):
+        """Test a credential with no User-Agent is not enough to bypass authentication."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-ep"])):
+            response = self._client().get("/gateway/proxy/my-ep/user-agent", headers={"Authorization": "Bearer upstream-token"})
+
+        assert response.status_code == 401
+
+    @patch("mlflow_oidc_auth.middleware.fastapi_permission_middleware.can_use_gateway_endpoint")
+    def test_authenticated_user_user_agent_is_untouched(self, mock_can_use):
+        """Test an authenticated caller keeps using the server-side key."""
+        mock_can_use.return_value = True
+        response = self._client(username="user@example.com").get("/gateway/proxy/my-ep/user-agent", headers=self._ODD_UA_HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["user_agents"] == ["weird-agent/9"]
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: X-Forwarded-Prefix must not shift the authorized path
+# ---------------------------------------------------------------------------
+
+
+class TestForwardedPrefixCannotBypassAuthorization:
+    """Test that a client-supplied X-Forwarded-Prefix cannot move the routed path
+    out of reach of the permission middleware."""
+
+    _CLI_HEADERS = {"user-agent": "claude-cli/1.0.99 (external, cli)", "Authorization": "Bearer upstream-token"}
+    _PREFIX = {"X-Forwarded-Prefix": "/proxied"}
+
+    def test_unauthenticated_unlisted_endpoint_behind_prefix_returns_401(self):
+        """Test a prefix-shifted path to an unlisted endpoint is still rejected."""
+        client = TestClient(_create_app_with_auth(username=None, with_proxy_headers=True))
+
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-ep"])):
+            response = client.get("/proxied/gateway/proxy/other-ep/models", headers={**self._CLI_HEADERS, **self._PREFIX})
+
+        assert response.status_code == 401
+
+    @patch("mlflow_oidc_auth.middleware.fastapi_permission_middleware.can_use_gateway_endpoint")
+    def test_authenticated_unauthorized_endpoint_behind_prefix_returns_403(self, mock_can_use):
+        """Test a prefix-shifted path still runs the per-endpoint permission check."""
+        mock_can_use.return_value = False
+        client = TestClient(_create_app_with_auth(username="user@example.com", is_admin=False, with_proxy_headers=True))
+
+        response = client.get("/proxied/gateway/proxy/my-ep/models", headers=self._PREFIX)
+
+        assert response.status_code == 403
+        mock_can_use.assert_called_once_with("my-ep", "user@example.com")
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: real AuthMiddleware + ProxyHeaders + permission middleware
+# ---------------------------------------------------------------------------
+
+
+def _create_app_with_real_auth_middleware():
+    """Wire the middleware exactly as app.create_app does: Auth → ProxyHeaders → Permission."""
+    from mlflow_oidc_auth.middleware.auth_middleware import AuthMiddleware
+    from mlflow_oidc_auth.middleware.fastapi_permission_middleware import (
+        add_fastapi_permission_middleware,
+    )
+    from mlflow_oidc_auth.middleware.proxy_headers_middleware import ProxyHeadersMiddleware
+
+    app = FastAPI()
+
+    @app.get("/gateway/proxy/{endpoint_name}/{path:path}")
+    async def gateway_proxy(endpoint_name: str, path: str):
+        return {"endpoint": endpoint_name, "path": path}
+
+    @app.get("/api/2.0/mlflow/permissions/users")
+    async def flask_style_route(request: Request):
+        return {"reached": True, "username": getattr(request.state, "username", None)}
+
+    add_fastapi_permission_middleware(app)
+    app.add_middleware(ProxyHeadersMiddleware)
+    app.add_middleware(AuthMiddleware)
+
+    return app
+
+
+class TestForwardedPrefixAgainstRealAuthMiddleware:
+    """AuthMiddleware runs outside ProxyHeadersMiddleware and so judges the path before the
+    client-supplied X-Forwarded-Prefix is stripped. Its admission must not carry over to
+    whichever route that prefix finally selects."""
+
+    _CLI_HEADERS = {"user-agent": "claude-cli/1.0.99 (external, cli)", "Authorization": "Bearer upstream-token"}
+
+    def _client(self):
+        return TestClient(_create_app_with_real_auth_middleware(), raise_server_exceptions=False)
+
+    def test_listed_endpoint_is_admitted_without_oidc_identity(self):
+        """Test the feature still works end to end through the real auth stack."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-ep"])):
+            response = self._client().get("/gateway/proxy/my-ep/models", headers=self._CLI_HEADERS)
+
+        assert response.status_code == 200
+        assert response.json() == {"endpoint": "my-ep", "path": "models"}
+
+    def test_prefix_cannot_divert_an_admitted_call_to_another_route(self):
+        """Test a prefix that reroutes an admitted gateway call elsewhere is rejected."""
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-ep"])):
+            response = self._client().get(
+                "/gateway/proxy/my-ep/api/2.0/mlflow/permissions/users",
+                headers={**self._CLI_HEADERS, "X-Forwarded-Prefix": "/gateway/proxy/my-ep"},
+            )
+
+        assert response.status_code == 401
+        assert "reached" not in response.json()
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: malformed bodies must not reach an unhandled exception
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedBodyOnUnauthenticatedGatewayCall:
+    """Test that an unauthenticated caller cannot turn a bad body into a 500."""
+
+    _CLI_HEADERS = {"user-agent": "claude-cli/1.0.99 (external, cli)", "Authorization": "Bearer upstream-token"}
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"model": {"a": 1}},
+            {"model": ["x"]},
+            {"model": 123},
+            ["not", "a", "dict"],
+            "juststring",
+        ],
+    )
+    def test_malformed_body_returns_401(self, body):
+        """Test each malformed body is rejected with 401 rather than crashing."""
+        client = TestClient(_create_app_with_auth(username=None))
+
+        with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-model"])):
+            response = client.post("/gateway/openai/v1/chat/completions", json=body, headers=self._CLI_HEADERS)
+
+        assert response.status_code == 401
+
+    def test_unexpected_allowlist_failure_returns_401(self):
+        """Test an unexpected error in the allowlist check fails closed."""
+        client = TestClient(_create_app_with_auth(username=None))
+
+        with patch(
+            "mlflow_oidc_auth.middleware.fastapi_permission_middleware.is_end_user_auth_endpoint",
+            side_effect=RuntimeError("boom"),
+        ):
+            with patch("mlflow_oidc_auth.utils.gateway_passthrough.config", _config(["my-ep"])):
+                response = client.get("/gateway/proxy/my-ep/models", headers=self._CLI_HEADERS)
+
+        assert response.status_code == 401

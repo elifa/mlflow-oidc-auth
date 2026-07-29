@@ -172,6 +172,10 @@ class AppConfig:
 
         # Feature flags
         self.OIDC_GEN_AI_GATEWAY_ENABLED = config_manager.get_bool("OIDC_GEN_AI_GATEWAY_ENABLED", default=True)
+        # Gateway endpoints whose callers authenticate to the upstream provider with their own
+        # credentials. These accept requests with no OIDC identity, so no per-endpoint permission
+        # check is possible; treat the list as a trust boundary. Empty disables the behaviour.
+        self.OIDC_GATEWAY_END_USER_AUTH_ENDPOINTS = config_manager.get_list("OIDC_GATEWAY_END_USER_AUTH_ENDPOINTS", default=[])
 
         # Workspace feature flags
         self.MLFLOW_ENABLE_WORKSPACES = config_manager.get_bool("MLFLOW_ENABLE_WORKSPACES", default=False)

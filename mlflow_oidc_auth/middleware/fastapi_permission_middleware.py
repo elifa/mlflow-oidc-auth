@@ -12,39 +12,24 @@ It mirrors the upstream ``add_fastapi_permission_middleware`` from
 
 from __future__ import annotations
 
-import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.routing import get_route_path
 
 from mlflow_oidc_auth.logger import get_logger
+from mlflow_oidc_auth.utils.gateway_passthrough import (
+    GATEWAY_PASSTHROUGH_SCOPE_KEY,
+    ROUTES_NEEDING_BODY,
+    allow_unauthenticated_gateway_call,
+    endpoint_name_from_path,
+    is_end_user_auth_endpoint,
+)
 from mlflow_oidc_auth.utils.permissions import can_use_gateway_endpoint
 
 logger = get_logger()
-
-
-# ---------------------------------------------------------------------------
-# Route patterns that need the request body to extract the endpoint name
-# (passthrough / chat-completion / embeddings / responses / messages)
-# ---------------------------------------------------------------------------
-_ROUTES_NEEDING_BODY = frozenset(
-    (
-        "/gateway/mlflow/v1/chat/completions",
-        "/gateway/openai/v1/chat/completions",
-        "/gateway/openai/v1/embeddings",
-        "/gateway/openai/v1/responses",
-        "/gateway/anthropic/v1/messages",
-    )
-)
-
-# Compiled patterns for Gemini routes that embed the endpoint name in the URL
-_GEMINI_GENERATE = re.compile(r"^/gateway/gemini/v1beta/models/([^/:]+):generateContent$")
-_GEMINI_STREAM = re.compile(r"^/gateway/gemini/v1beta/models/([^/:]+):streamGenerateContent$")
-
-# Pattern: /gateway/{endpoint_name}/mlflow/invocations
-_INVOCATIONS_RE = re.compile(r"^/gateway/([^/]+)/mlflow/invocations$")
 
 
 # ---------------------------------------------------------------------------
@@ -52,31 +37,55 @@ _INVOCATIONS_RE = re.compile(r"^/gateway/([^/]+)/mlflow/invocations$")
 # ---------------------------------------------------------------------------
 
 
-def _extract_gateway_endpoint_name(path: str, body: dict[str, Any] | None) -> str | None:
-    """Extract endpoint name from gateway routes.
+def _extract_gateway_endpoint_name(path: str, body: Any) -> str | None:
+    """Extract the target endpoint name from the URL, or from the body for routes carrying it there."""
+    if name := endpoint_name_from_path(path):
+        return name
 
-    Supports:
-    - ``/gateway/{endpoint_name}/mlflow/invocations``
-    - Passthrough routes (endpoint in request body as ``model``)
-    - Gemini routes (endpoint in URL path segment)
-    """
-    # Pattern 1: /gateway/{endpoint_name}/mlflow/invocations
-    if match := _INVOCATIONS_RE.match(path):
-        return match.group(1)
+    if path in ROUTES_NEEDING_BODY and isinstance(body, dict):
+        model = body.get("model")
 
-    # Pattern 2-6: Passthrough routes (endpoint in request body as "model")
-    if path in _ROUTES_NEEDING_BODY:
-        if body:
-            return body.get("model")
-        return None
-
-    # Pattern 7-8: Gemini routes (endpoint in URL path)
-    if match := _GEMINI_GENERATE.match(path):
-        return match.group(1)
-    if match := _GEMINI_STREAM.match(path):
-        return match.group(1)
+        return model if isinstance(model, str) else None
 
     return None
+
+
+async def _resolve_gateway_endpoint_name(path: str, request: Request) -> str | None:
+    """Resolve the target endpoint name, reading and caching the body when required."""
+    body: Any = None
+    if path in ROUTES_NEEDING_BODY and request.method not in ("GET", "HEAD"):
+        try:
+            body = await request.json()
+            # Starlette allows the body to be read only once.
+            request.state.cached_body = body
+        except Exception:
+            return None
+
+    return _extract_gateway_endpoint_name(path, body)
+
+
+async def _is_designated_end_user_auth_call(path: str, request: Request) -> bool:
+    """Check whether an unauthenticated gateway call targets a designated end-user-auth endpoint."""
+    try:
+        if not allow_unauthenticated_gateway_call(path, request.headers):
+            return False
+
+        endpoint_name = await _resolve_gateway_endpoint_name(path, request)
+
+        return endpoint_name is not None and is_end_user_auth_endpoint(endpoint_name)
+    except Exception:
+        logger.exception("Unauthenticated gateway check failed for path %s", path)
+
+        return False
+
+
+def _authentication_required_response() -> JSONResponse:
+    """Build the 401 returned to callers with no usable identity."""
+    return JSONResponse(
+        status_code=401,
+        content={"detail": "Authentication required"},
+        headers={"WWW-Authenticate": 'Basic realm="mlflow"'},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -93,17 +102,7 @@ def _get_gateway_validator(
     """
 
     async def validator(username: str, request: Request) -> bool:
-        body: dict[str, Any] | None = None
-        if path in _ROUTES_NEEDING_BODY:
-            try:
-                body = await request.json()
-                # Cache parsed body so the downstream route handler can reuse it
-                # (Starlette request body can only be read once).
-                request.state.cached_body = body
-            except Exception:
-                return False
-
-        endpoint_name = _extract_gateway_endpoint_name(path, body)
+        endpoint_name = await _resolve_gateway_endpoint_name(path, request)
         if endpoint_name is None:
             logger.warning("Gateway validator: no endpoint name found in request path %s", path)
             return False
@@ -188,21 +187,33 @@ def add_fastapi_permission_middleware(app: FastAPI) -> None:
 
     @app.middleware("http")
     async def fastapi_permission_middleware(request: Request, call_next):
-        path = request.url.path
+        # Authorize on the path Starlette actually routes on, not the external path:
+        # ProxyHeadersMiddleware derives root_path from the client-supplied X-Forwarded-Prefix.
+        path = get_route_path(request.scope)
+
+        # Check authentication context (already set by AuthMiddleware)
+        username = getattr(request.state, "username", None)
+
+        # AuthMiddleware runs outside ProxyHeadersMiddleware, so it judged the path before the
+        # client-supplied X-Forwarded-Prefix was stripped. Re-check what it admitted against
+        # the path actually routed, or that prefix could divert the call to any other route.
+        if not username and request.scope.get(GATEWAY_PASSTHROUGH_SCOPE_KEY):
+            if await _is_designated_end_user_auth_call(path, request):
+                return await call_next(request)
+
+            logger.info("Unauthenticated gateway call rejected for path %s", path)
+
+            return _authentication_required_response()
 
         # Find validator for this route — returns None for Flask-handled routes
         validator = _find_fastapi_validator(path)
         if validator is None:
             return await call_next(request)
 
-        # Check authentication context (already set by AuthMiddleware)
-        username = getattr(request.state, "username", None)
         if not username:
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Authentication required"},
-                headers={"WWW-Authenticate": 'Basic realm="mlflow"'},
-            )
+            logger.info("Unauthenticated request rejected for path %s", path)
+
+            return _authentication_required_response()
 
         # Admins have full access
         is_admin = getattr(request.state, "is_admin", False)

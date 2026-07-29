@@ -158,6 +158,31 @@ Gateway permissions are managed through:
 - **REST API**: `/api/2.0/mlflow/permissions/gateways/` endpoints
 - **Before-request hooks**: Enforce permissions on all gateway operations
 
+### End-user-authenticated endpoints
+
+Endpoints named in `OIDC_GATEWAY_END_USER_AUTH_ENDPOINTS` are an exception to the model above. Coding agents such as the GitHub Copilot CLI hold their own upstream provider credentials and cannot perform an OIDC login, so calls to these endpoints are accepted without an OIDC session — and with no OIDC identity there is no user to evaluate a USE permission against.
+
+The list is therefore a trust boundary rather than a permission: anyone who can reach the server and present a recognised CLI `User-Agent` plus a provider credential may invoke those endpoints. Two limits apply:
+
+- Only gateway *invocation* routes are eligible. Gateway management APIs always require a full OIDC identity.
+- MLflow must recognise the caller's `User-Agent` as a CLI supplying its own credentials. It replaces the credential with the endpoint's configured server key for anyone else, so unrecognised callers are rejected with `401` instead of being served at the server key's expense.
+
+Endpoints not on the list continue to require authentication and USE permission.
+
+#### Only list endpoints whose provider honours caller credentials
+
+Substituting the caller's credential for the endpoint's configured one is a per-provider behaviour in MLflow, not a gateway-wide guarantee. Only the OpenAI, OpenAI-compatible, Anthropic and Gemini header paths drop the server credential when the caller supplies its own:
+
+| Provider | Listing it is |
+| --- | --- |
+| `openai`, `azure`, `anthropic`, `gemini`, `vertex_ai`, `databricks`, `deepseek`, `groq`, `ollama`, `openrouter`, `xai` | Safe — the caller's credential replaces the server key |
+| `portkey` | **Unsafe** — it drops only `Authorization` while its own key rides in `x-portkey-api-key`, which is always sent |
+| `ai21labs`, `bedrock`, `cohere`, `huggingface-text-generation-inference`, `litellm`, `mistral`, `mlflow-model-serving`, `mosaicml`, `palm`, `togetherai` | **Unsafe** — caller credentials are ignored entirely |
+
+Listing an endpoint backed by an unsafe provider turns it into an unauthenticated proxy onto **your** credential: the call is admitted without an OIDC identity, then billed to the server-side key. `bedrock` bills the configured AWS account and `mlflow-model-serving` has no credential at all, making the model server anonymously reachable.
+
+Verify the endpoint's provider before adding it to the list.
+
 ## GraphQL Authorization
 
 The plugin enforces permissions on MLflow's GraphQL API (`/graphql`) through a custom middleware:

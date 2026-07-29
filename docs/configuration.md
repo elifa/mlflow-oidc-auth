@@ -67,6 +67,7 @@ The application is configured through environment variables, `.env` files, or pl
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `OIDC_GEN_AI_GATEWAY_ENABLED` | Boolean | `true` | Enable AI Gateway permission management in the admin UI and API. Disable if you don't use MLflow AI Gateway |
+| `OIDC_GATEWAY_END_USER_AUTH_ENDPOINTS` | List | *(empty)* | Comma-separated list of gateway endpoint names whose callers authenticate to the upstream provider with their own credentials. These endpoints accept requests without an OIDC session and therefore have no per-endpoint permission check, so the list is a trust boundary. A request is admitted only if MLflow recognises its `User-Agent` as a CLI that supplies its own credentials, because MLflow otherwise substitutes the server's configured API key; other callers get `401` rather than silently spending that key. Only list endpoints whose provider actually honours caller credentials — see [Gateway Permissions](permissions#end-user-authenticated-endpoints) for the provider table. All other gateway endpoints continue to require authentication and USE permission |
 | `MLFLOW_ENABLE_WORKSPACES` | Boolean | `false` | Enable workspace (multi-tenant) support. Requires MLflow >=3.10. See [Workspaces](workspaces) |
 | `ENABLE_API_DOCS` | Boolean | `true` | Enable OpenAPI documentation at `/openapi.json`, Swagger UI at `/docs`, and ReDoc at `/redoc` |
 
